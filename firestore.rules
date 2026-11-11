@@ -1,0 +1,100 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // The logged-in user's own profile document.
+    function me() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    // SUPER ADMIN: users/{uid}.role == 'admin'. Can do everything.
+    function isSuper() {
+      return signedIn() && me().role == 'admin';
+    }
+
+    // DOMAIN ADMIN: users/{uid}.role == 'domain_admin' and users/{uid}.domain
+    // is 'canteen', 'hostel' or 'admin_block'.
+    // KEEP THESE TWO LISTS THE SAME AS lib/domains.dart
+    function catsFor(d) {
+      return d == 'canteen' ? ['Food & Canteen']
+           : d == 'hostel' ? ['Hostel']
+           : d == 'admin_block' ? ['Academic', 'Examination', 'Fees', 'Campus Complaint']
+           : [];
+    }
+    function sectionsFor(d) {
+      return d == 'canteen' ? ['canteens']
+           : d == 'hostel' ? ['hostel']
+           : d == 'admin_block' ? ['academic', 'exams', 'blocks']
+           : [];
+    }
+
+    function isDomainAdmin() {
+      return signedIn() && me().role == 'domain_admin';
+    }
+    function ownsCategory(cat) {
+      return isDomainAdmin() && cat in catsFor(me().domain);
+    }
+    function ownsSection(sec) {
+      return isDomainAdmin() && sec in sectionsFor(me().domain);
+    }
+
+    // One profile per user. Students can only create their own profile as 'student'.
+    // Only the super admin can change roles.
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isSuper());
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.role == 'student'
+        && request.resource.data.keys().hasOnly(['register_number', 'full_name', 'role', 'created_at']);
+      allow update, delete: if isSuper();
+    }
+
+    // Complaints: students see and create their own.
+    // Super admin sees all. A domain admin sees and changes the status of
+    // complaints of his own domain only.
+    match /complaints/{id} {
+      allow read: if signedIn() && (
+        resource.data.student_id == request.auth.uid
+        || isSuper()
+        || ownsCategory(resource.data.category));
+      allow create: if signedIn()
+        && request.resource.data.student_id == request.auth.uid
+        && request.resource.data.status == 'Pending';
+      allow update: if signedIn() && (
+        isSuper()
+        || (ownsCategory(resource.data.category)
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updated_at'])
+            && request.resource.data.status in ['Pending', 'In Progress', 'Resolved']));
+      allow delete: if false;
+    }
+
+    // Counter that gives complaint numbers KARE-1024, KARE-1025 ...
+    match /counters/complaints {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.resource.data.last == 1024;
+      allow update: if signedIn() && request.resource.data.last == resource.data.last + 1;
+    }
+
+    // Information pages: everyone signed in reads.
+    // Super admin edits everything; a domain admin edits only his own sections.
+    match /info_items/{id} {
+      allow read: if signedIn();
+      allow create: if isSuper() || ownsSection(request.resource.data.section);
+      allow update: if isSuper()
+        || (ownsSection(resource.data.section) && request.resource.data.section == resource.data.section);
+      allow delete: if isSuper() || ownsSection(resource.data.section);
+    }
+
+    // Courses and fees: everyone reads. Super admin and the Admin Block admin
+    // can change the fees; only the super admin can add or remove courses.
+    match /programs/{id} {
+      allow read: if signedIn();
+      allow create, delete: if isSuper();
+      allow update: if isSuper() || (isDomainAdmin() && me().domain == 'admin_block');
+    }
+  }
+}
